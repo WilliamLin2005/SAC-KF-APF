@@ -1,0 +1,11 @@
+# PyTorch is intentionally not listed here.
+# Use the PyTorch already installed in your conda env, for example rl_env.
+# If pip still tries to download torch, the active Python env is probably wrong
+# or its torch version is older than the stable-baselines3 requirement.
+gymnasium>=0.29.1,<0.30
+stable-baselines3==2.3.2
+numpy>=1.24,<2.0
+matplotlib>=3.5
+scipy>=1.8
+tqdm>=4.64
+tensorboard>=2.10
