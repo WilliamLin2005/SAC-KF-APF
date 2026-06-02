@@ -5,15 +5,12 @@ from __future__ import annotations
 import argparse
 import random
 from pathlib import Path
-from typing import Sequence
 
 import numpy as np
 import torch
 from stable_baselines3 import SAC
-from stable_baselines3.common.buffers import ReplayBuffer
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.type_aliases import ReplayBufferSamples
 from stable_baselines3.common.utils import set_random_seed
 from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
@@ -30,190 +27,6 @@ from utils.training_callbacks import TensorboardMetricsCallback, TqdmTrainingCal
 
 DEFAULT_RUN_NAME = "vw_apf_sac_fixed_kf_in_loop_kf_state_two_phase"
 DEFAULT_MODEL_PATH = Path("outputs/vw/ablation") / f"{DEFAULT_RUN_NAME}.zip"
-APF_SUCCESS_REPLAY_RATIO = 0.25
-APF_SUCCESS_REPLAY_DECAY_FRACTION = 0.5
-APF_SUCCESS_BUFFER_SIZE = 500_000
-
-
-class ApfSuccessReplayBuffer(ReplayBuffer):
-    """Mix ordinary replay with a decaying sub-batch from successful APF episodes."""
-
-    def __init__(
-        self,
-        *args,
-        apf_success_ratio_initial: float = APF_SUCCESS_REPLAY_RATIO,
-        apf_success_decay_fraction: float = APF_SUCCESS_REPLAY_DECAY_FRACTION,
-        total_timesteps: int = 1,
-        apf_success_buffer_size: int = APF_SUCCESS_BUFFER_SIZE,
-        **kwargs,
-    ) -> None:
-        super().__init__(*args, **kwargs)
-        self.apf_success_ratio_initial = float(apf_success_ratio_initial)
-        self.apf_success_decay_fraction = max(float(apf_success_decay_fraction), 1.0e-6)
-        self.total_timesteps = max(int(total_timesteps), 1)
-        self.apf_success_ratio_current = max(self.apf_success_ratio_initial, 0.0)
-        self.apf_success_buffer_size = max(int(apf_success_buffer_size), 1)
-        self.apf_success_pos = 0
-        self.apf_success_full = False
-        self.apf_success_episode_count = 0
-        self.apf_success_transition_count = 0
-        self.last_sample_apf_success_count = 0
-        self.last_sample_apf_success_ratio = 0.0
-
-        self.apf_success_observations = np.zeros(
-            (self.apf_success_buffer_size, *self.obs_shape),
-            dtype=self.observation_space.dtype,
-        )
-        self.apf_success_next_observations = np.zeros(
-            (self.apf_success_buffer_size, *self.obs_shape),
-            dtype=self.observation_space.dtype,
-        )
-        self.apf_success_actions = np.zeros(
-            (self.apf_success_buffer_size, self.action_dim),
-            dtype=self._maybe_cast_dtype(self.action_space.dtype),
-        )
-        self.apf_success_rewards = np.zeros(self.apf_success_buffer_size, dtype=np.float32)
-        self.apf_success_dones = np.zeros(self.apf_success_buffer_size, dtype=np.float32)
-        self.apf_success_timeouts = np.zeros(self.apf_success_buffer_size, dtype=np.float32)
-
-    @property
-    def apf_success_size(self) -> int:
-        return self.apf_success_buffer_size if self.apf_success_full else self.apf_success_pos
-
-    def set_training_progress(self, completed_timesteps: int, total_timesteps: int | None = None) -> None:
-        if total_timesteps is not None:
-            self.total_timesteps = max(int(total_timesteps), 1)
-        decay_steps = max(
-            int(round(self.total_timesteps * self.apf_success_decay_fraction)),
-            1,
-        )
-        progress = min(max(int(completed_timesteps), 0) / decay_steps, 1.0)
-        self.apf_success_ratio_current = self.apf_success_ratio_initial * (1.0 - progress)
-
-    def add_apf_success_episode(self, transitions: Sequence[tuple]) -> None:
-        if not transitions:
-            return
-        for transition in transitions:
-            self.add_apf_success_transition(*transition)
-        self.apf_success_episode_count += 1
-
-    def add_apf_success_transition(
-        self,
-        obs,
-        next_obs,
-        action,
-        reward,
-        done,
-        info,
-    ) -> None:
-        self.apf_success_observations[self.apf_success_pos] = np.asarray(obs)
-        self.apf_success_next_observations[self.apf_success_pos] = np.asarray(next_obs)
-        self.apf_success_actions[self.apf_success_pos] = np.asarray(action).reshape(self.action_dim)
-        self.apf_success_rewards[self.apf_success_pos] = float(reward)
-        self.apf_success_dones[self.apf_success_pos] = float(done)
-        self.apf_success_timeouts[self.apf_success_pos] = float(
-            bool(info.get("TimeLimit.truncated", False)) if isinstance(info, dict) else False
-        )
-        self.apf_success_transition_count += 1
-        self.apf_success_pos += 1
-        if self.apf_success_pos >= self.apf_success_buffer_size:
-            self.apf_success_full = True
-            self.apf_success_pos = 0
-
-    def _sample_apf_success(self, batch_size: int, env=None) -> ReplayBufferSamples:
-        if self.apf_success_size <= 0:
-            raise RuntimeError("Cannot sample APF success replay because it is empty.")
-        batch_inds = np.random.randint(0, self.apf_success_size, size=batch_size)
-        data = (
-            self._normalize_obs(self.apf_success_observations[batch_inds], env),
-            self.apf_success_actions[batch_inds],
-            self._normalize_obs(self.apf_success_next_observations[batch_inds], env),
-            (
-                self.apf_success_dones[batch_inds]
-                * (1.0 - self.apf_success_timeouts[batch_inds])
-            ).reshape(-1, 1),
-            self._normalize_reward(self.apf_success_rewards[batch_inds].reshape(-1, 1), env),
-        )
-        return ReplayBufferSamples(*tuple(map(self.to_torch, data)))
-
-    @staticmethod
-    def _concat_samples(left: ReplayBufferSamples, right: ReplayBufferSamples) -> ReplayBufferSamples:
-        values = []
-        for field in left._fields:
-            values.append(torch.cat((getattr(left, field), getattr(right, field)), dim=0))
-        perm = torch.randperm(values[0].shape[0], device=values[0].device)
-        return ReplayBufferSamples(*[value[perm] for value in values])
-
-    def sample(self, batch_size: int, env=None) -> ReplayBufferSamples:
-        success_count = int(round(batch_size * max(self.apf_success_ratio_current, 0.0)))
-        success_count = min(max(success_count, 0), batch_size)
-        if success_count <= 0 or self.apf_success_size <= 0:
-            self.last_sample_apf_success_count = 0
-            self.last_sample_apf_success_ratio = 0.0
-            return super().sample(batch_size=batch_size, env=env)
-
-        normal_count = batch_size - success_count
-        success_samples = self._sample_apf_success(success_count, env=env)
-        if normal_count <= 0:
-            self.last_sample_apf_success_count = success_count
-            self.last_sample_apf_success_ratio = 1.0
-            return success_samples
-
-        normal_samples = super().sample(batch_size=normal_count, env=env)
-        self.last_sample_apf_success_count = success_count
-        self.last_sample_apf_success_ratio = success_count / float(batch_size)
-        return self._concat_samples(normal_samples, success_samples)
-
-    def apf_success_stats(self) -> dict[str, float]:
-        return {
-            "ratio_current": float(self.apf_success_ratio_current),
-            "ratio_initial": float(self.apf_success_ratio_initial),
-            "decay_fraction": float(self.apf_success_decay_fraction),
-            "buffer_size": float(self.apf_success_buffer_size),
-            "stored_transitions": float(self.apf_success_size),
-            "total_transitions": float(self.apf_success_transition_count),
-            "episodes": float(self.apf_success_episode_count),
-            "last_sample_count": float(self.last_sample_apf_success_count),
-            "last_sample_ratio": float(self.last_sample_apf_success_ratio),
-        }
-
-
-class ApfSuccessReplayCallback(BaseCallback):
-    """Advance APF-success decay and expose replay metrics in TensorBoard."""
-
-    def __init__(self, writer: SummaryWriter, total_timesteps: int, log_freq: int = 100) -> None:
-        super().__init__()
-        self.writer = writer
-        self.total_timesteps = max(int(total_timesteps), 1)
-        self.log_freq = max(int(log_freq), 1)
-
-    def _on_training_start(self) -> None:
-        self._set_progress(0)
-
-    def _on_step(self) -> bool:
-        self._set_progress(int(self.num_timesteps))
-        if self.n_calls % self.log_freq == 0:
-            self._write_stats(int(self.num_timesteps))
-        return True
-
-    def _on_training_end(self) -> None:
-        self._write_stats(int(self.num_timesteps))
-        self.writer.flush()
-
-    def _set_progress(self, completed_timesteps: int) -> None:
-        replay_buffer = getattr(self.model, "replay_buffer", None)
-        if isinstance(replay_buffer, ApfSuccessReplayBuffer):
-            replay_buffer.set_training_progress(completed_timesteps, self.total_timesteps)
-
-    def _write_stats(self, step: int) -> None:
-        replay_buffer = getattr(self.model, "replay_buffer", None)
-        if not isinstance(replay_buffer, ApfSuccessReplayBuffer):
-            return
-        stats = replay_buffer.apf_success_stats()
-        self.writer.add_scalar("apf_success/ratio_current", stats["ratio_current"], step)
-        self.writer.add_scalar("apf_success/stored_transitions", stats["stored_transitions"], step)
-        self.writer.add_scalar("apf_success/episodes", stats["episodes"], step)
-        self.writer.add_scalar("apf_success/last_sample_ratio", stats["last_sample_ratio"], step)
 
 
 def parse_args() -> argparse.Namespace:
@@ -354,7 +167,6 @@ def run_apf_warmup(
         truncated = False
         episode_return = 0.0
         episode_steps = 0
-        episode_transitions: list[tuple] = []
         final_info = {}
 
         while not (terminated or truncated):
@@ -374,16 +186,6 @@ def run_apf_warmup(
                 done=terminated or truncated,
                 info=info,
             )
-            episode_transitions.append(
-                (
-                    np.array(obs, copy=True),
-                    np.array(next_obs, copy=True),
-                    np.array(action, copy=True),
-                    float(reward),
-                    bool(terminated or truncated),
-                    dict(info),
-                )
-            )
             obs = next_obs
             episode_return += float(reward)
             episode_steps += 1
@@ -391,11 +193,6 @@ def run_apf_warmup(
             final_info = info
             docking_entries += int(bool(info.get("entered_docking_zone", False)))
 
-        if bool(final_info.get("success", False)) and isinstance(
-            model.replay_buffer,
-            ApfSuccessReplayBuffer,
-        ):
-            model.replay_buffer.add_apf_success_episode(episode_transitions)
         successes += int(bool(final_info.get("success", False)))
         collisions += int(bool(final_info.get("collision", False)))
         out_of_bounds += int(bool(final_info.get("out_of_bounds", False)))
@@ -415,19 +212,12 @@ def run_apf_warmup(
     writer.add_scalar("apf/out_of_bounds_rate", out_of_bounds / max(1, episodes), episodes)
     writer.add_scalar("apf/timeout_rate", timeouts / max(1, episodes), episodes)
     writer.add_scalar("apf/docking_entries", docking_entries, episodes)
-    if isinstance(model.replay_buffer, ApfSuccessReplayBuffer):
-        stats = model.replay_buffer.apf_success_stats()
-        writer.add_scalar("apf_success/ratio_current", stats["ratio_current"], episodes)
-        writer.add_scalar("apf_success/stored_transitions", stats["stored_transitions"], episodes)
-        writer.add_scalar("apf_success/episodes", stats["episodes"], episodes)
-        writer.add_scalar("apf_success/last_sample_ratio", stats["last_sample_ratio"], episodes)
     writer.flush()
 
     print(
         "Robot v/w two-phase APF warm-up finished: "
         f"episodes={episodes}, transitions={total_steps}, "
         f"buffer_size={replay_buffer_size(model)}, "
-        f"apf_success={model.replay_buffer.apf_success_stats()}, "
         f"success_rate={successes / max(1, episodes):.3f}, "
         f"collision_rate={collisions / max(1, episodes):.3f}, "
         f"out_of_bounds_rate={out_of_bounds / max(1, episodes):.3f}, "
@@ -480,13 +270,6 @@ def main() -> None:
         train_freq=1,
         gradient_steps=1,
         learning_starts=learning_starts,
-        replay_buffer_class=ApfSuccessReplayBuffer,
-        replay_buffer_kwargs={
-            "apf_success_ratio_initial": APF_SUCCESS_REPLAY_RATIO,
-            "apf_success_decay_fraction": APF_SUCCESS_REPLAY_DECAY_FRACTION,
-            "total_timesteps": args.total_steps,
-            "apf_success_buffer_size": APF_SUCCESS_BUFFER_SIZE,
-        },
         ent_coef="auto",
         policy_kwargs={"net_arch": [256, 256]},
         tensorboard_log=str(log_dir),
@@ -513,11 +296,6 @@ def main() -> None:
             log_freq=args.tb_log_freq,
         ),
         TwoPhaseMetricsCallback(writer=writer, log_freq=args.tb_log_freq),
-        ApfSuccessReplayCallback(
-            writer=writer,
-            total_timesteps=args.total_steps,
-            log_freq=args.tb_log_freq,
-        ),
     ]
     if args.show_progress:
         callbacks.insert(0, TqdmTrainingCallback(total_timesteps=args.total_steps))
